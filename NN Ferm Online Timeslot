@@ -1,0 +1,320 @@
+//Script will allow for pulling process data from any table (equipment) in the NN SQL database
+//Table (equipment) ID and start and end times are required for manual entry
+//Columns will be renamed in this script as long as if they are entered into the column mapper
+
+//Identifying basepath based on operating system
+
+os = If( Host is( Windows ),
+	"windows",
+	"posix"
+);
+
+
+if (os != "windows",
+		New Window("Script Only Runs on Windows",
+		<< Modal,
+		V List Box(
+			Text Box (""),
+			Text Box("This script will only run on Windows.")
+			)
+		);
+		Throw()	
+	);
+	
+
+basepath = If( Host is( Windows ),
+	"\\fileshare.perfectday.space\InternalShares\",
+	"/Volumes/InternalShares/"
+);
+
+
+//fixFilePath function for defining file paths
+
+fixFilePath = Function( {filepath},
+
+    regex_chars = {};
+    basepath = "";
+
+    If (substr(filepath,1,1) == "R",
+        regex_chars = {"^[a-z]+:", "^\\+", "^/+", "InternalShares(\\|/)"};
+        basepath =    "\\fileshare.perfectday.space\InternalShares\";
+    ); 
+
+    If (substr(filepath,1,1) == "X",
+        regex_chars = {"^[a-z]+:", "^\\+", "^/+", "ExternalShares(\\|/)"};
+        basepath =    "\\fileshare.perfectday.space\ExternalShares\";
+    );     
+
+    While( N Items( regex_chars ) > 0,
+        char = Remove From( regex_chars, 1 );
+        char = char[1];
+        regex_str = Regex( filepath, char, "\0", IGNORECASE );
+        position = If( Is Missing( regex_str ),
+            0,
+            Contains( filepath, regex_str )
+        );
+
+        filepath = If( position > 0,
+            Right( filepath, Length( filepath ) - (position + Length( regex_str ) - 1) ),
+            filepath
+        );
+    );
+
+    filepath = Convert File Path( filepath, "absolute", os, base( basepath ) );
+
+);
+
+
+//All file paths for data used in this JSL listed below and symbols cleared
+
+Clear Symbols(
+		NN_Col_Map_file
+);
+
+
+//NN Col Mapper File path (saved as CSV)
+
+NN_Col_Map_file = fixFilePath("R:\Data\Manufacturing\JMP scripts\Ferm JMP Scripts\Neptune Scripts\Column Mappers\NN Column Mapper.csv");
+
+
+//Getting list of equipment data tables in NN SQL database
+
+sql_query = "SELECT TABLE_NAME FROM Information_Schema.Tables
+	WHERE TABLE_SCHEMA = 'EasyProcess_PD_Process_Data_Settimo'";
+
+Open Database("DSN=nn_mirrored_db",        
+	sql_query,        
+	"SQL Tables" );
+	
+sqltables = :TABLE_NAME << Get Values();
+
+Close(Data Table("SQL Tables"), No Save);
+
+
+//Selection window for the start and stop time you want to pull data
+
+New Window( "Start and Stop Time of Desired Data", <<Modal,
+	sd=Today();
+	ed=Today();
+	VListBox(
+		Text Box(""),
+		Text Box("Choose only 1 Equipment ID"),
+		Text Box(""),
+		PanelBox(
+			"Equipment ID",
+			sqltable_entry = ListBox(sqltables)
+		)
+		,
+		HListBox(
+			PanelBox( 
+				"Start Time",
+				scal = Calendar Box(, SetFunction(Function({this}, sd=scal<< Get Date) ))
+			),
+			spacerbox(Size(20,20)),
+			PanelBox( 
+				"End Time",
+				ecal = Calendar Box(, SetFunction(Function({this}, ed=ecal<< Get Date) ))
+			)
+		),
+		Bbox = Button Box(
+			"OK",
+			SelectedSQLTables = sqltable_entry << Get Selected;
+			BBox<<Close Window
+		)
+	)
+);
+
+
+//Converting from JMP time to Unix time
+//Necessary for identifying the timestamps in SQL
+
+unixsd = sd - 2082816000;
+unixed = ed - 2082816000;
+
+
+//Creating timestamps into a readable format for naming the datatable
+
+sdtimestamp = format(sd, "yyyy-mm-ddThh:mm:ss");
+edtimestamp = format(ed, "yyyy-mm-ddThh:mm:ss");
+
+
+//Pulling selected data from SQL
+
+sql_query = "select *         
+	from EasyProcess_PD_Process_Data_Settimo."||SelectedSQLTables[1]||         
+	" where TS1 between "||Char(unixsd)||" and "||Char(unixed); 
+
+Open Database("DSN=nn_mirrored_db",        
+	sql_query,        
+	SelectedSQLTables[1] );
+
+
+//Cleaning up the raw data
+
+dt = Current Data Table();
+
+dt << Set Name(SelectedSQLTables[1]||" "||Char(sdtimestamp)||" to "||Char(edtimestamp));
+
+ColNamesList = Current Data Table() << Get Column Names(string);
+
+NCols = N Items(ColNamesList);
+
+For(
+	i=NCols,
+	i>=1,
+	i--,
+	If(
+		Or(
+			Contains(ColNamesList[i], "_TS"),
+			Contains(ColNamesList[i], "_Q")
+		),
+		dt << Delete Column(Char(ColNamesList[i]))
+	)
+);
+
+
+dt << Delete Column("TS2");
+dt << Delete Column("id");
+
+:TS1 << Data Type (Numeric);
+:TS1 << Modeling Type (Continuous);
+
+
+//Creating a column that converts the UNIX timestamp to JMP timestamp
+
+col_name_list = Current Data Table() << get column names (string);     //Gets all the column names from the table into an array called "col_name_list"
+		
+If(
+	!contains(col_name_list,"Timestamp"),     //If the column name doesn't exist in the array col_name_list
+	Current Data Table() << New Column (     //Then creates the new column in the data table
+		"Timestamp",      //Names the new column
+		Numeric,      //Sets the Data Type of the column to Numeric
+		Continuous,     //Sets the Modeling Type of the column to Continuous
+		Formula(
+			:TS1 + 2082816000
+		)
+	)    
+);
+
+:Timestamp << Format("y/m/d h:m:s");
+:Timestamp << Set Selected (1);
+dt << Move Selected Columns (To First);
+
+
+//Getting Col Mapper Data
+
+If(
+	File Exists(
+		NN_Col_Map_file
+	),
+	Open(
+		NN_Col_Map_file
+	);
+	Current Data Table () << Set Name(
+		"Column Mapper"
+	),
+	New Window ("File Not Found",     //If the file does NOT exist in the folder, then this dialog box will open
+		<< Modal,
+		V List Box(
+			Text Box(""),
+			Text Box("Column mapper file cannot be found: " || NN_Col_Map_file),
+			Text Box (""),
+			Button Box("OK")
+		)
+	)
+);
+
+
+//Saving column names from the col mapper file
+
+Clear Symbols(
+	NSMainFermTags,
+	PDColNames,
+	MainFermOnlineDataTypes,
+	MainFermOnlineModTypes
+);
+
+//Get NN tags from Col 1 of the mapper
+		
+if (os == "windows",
+	NSMainFermTags = :Name("NN Tag Column") << Get Values,
+	NSMainFermTags = :Name("NN Tag Column") << Get Values);
+		
+		
+//Get PD Desired Col Names from Col 2 of the mapper
+		
+if (os == "windows",
+	PDColNames = :Name("PD Desired Col Name") << Get Values,
+	PDColNames = :Name("PD Desired Col Name") << Get Values);
+
+
+//Get Main Ferm Online Col data Types
+
+if (os == "windows",
+	MainFermOnlineDataTypes = :Name("Data Type") << Get Values,
+	MainFermOnlineDataTypes = :Name("Data Type") << Get Values);
+
+
+//Get Main Ferm Online Col modeling types
+
+if (os == "windows",
+	MainFermOnlineModTypes = :Name("Modeling Type") << Get Values,
+	MainFermOnlineModTypes = :Name("Modeling Type") << Get Values);
+
+
+//Closing the col mapper data table now that lists are already saved
+
+Close(Data Table("Column Mapper"), No Save);
+
+
+//Renaming column names based on col mapper
+
+Clear Symbols(
+	ColNames,
+	NCol,
+	iCol,
+	MapPos
+);
+
+
+ColNames = Current Data Table() << Get Column Names(String);
+NCol = NItems (ColNames);
+NewNames = Col Names;
+
+
+//Cycle through col names and rename them in the list
+			
+For(
+	iCol = 1,
+	iCol <= NCol,
+	iCol ++,
+	MapPos = Contains(NSMainFermTags, ColNames[iCol]);
+	If(
+		MapPos > 0,
+		Substitute Into(NewNames, ColNames[iCol],PDColNames[MapPos])
+	)
+);
+
+
+//Set new column names for batch data table
+		
+For(
+	iCol = 1,
+	iCol <= NCol,
+	iCol ++,
+	Column(Current Data Table(),iCol) << Set Name(NewNames[iCol])
+);
+
+
+For(
+	iCol = 1,
+	iCol <= NCol,
+	iCol ++,
+	MapPos = Contains(PDColNames,NewNames[iCol]);
+	If(
+		MapPos > 0,
+		Column(NewNames[iCol]) 
+			<< Data Type(MainFermOnlineDataTypes[MapPos]) 
+			<< Modeling Type(MainFermOnlineModTypes[MapPos]);
+	)
+);
